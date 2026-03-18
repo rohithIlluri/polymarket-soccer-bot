@@ -1,5 +1,5 @@
 """
-market_data.py — IMMUTABLE infrastructure layer.
+market_data.py — Infrastructure layer.
 DO NOT MODIFY — this file is never edited by the agent.
 
 Provides:
@@ -9,16 +9,20 @@ Provides:
 - Bookmaker edge detection (The Odds API)
 - Order execution (py-clob-client → Polymarket CLOB)
 - P&L tracking and risk controls
+- Thread-safe market cache and bet history
 """
 import os
 import json
 import time
 import logging
 import asyncio
+import threading
 import requests
 import numpy as np
 import websockets
+from logging.handlers import RotatingFileHandler
 from datetime import datetime, timezone
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
 from dotenv import load_dotenv
@@ -27,10 +31,17 @@ from py_clob_client.clob_types import ApiCreds, MarketOrderArgs, OrderType
 from py_clob_client.order_builder.constants import BUY, SELL
 
 load_dotenv()
+
+# ── Logging ───────────────────────────────────────────────────────────────
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+log_format = "%(asctime)s %(levelname)s [%(threadName)s] %(name)s %(message)s"
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.StreamHandler(), logging.FileHandler("bot.log")],
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format=log_format,
+    handlers=[
+        logging.StreamHandler(),
+        RotatingFileHandler("bot.log", maxBytes=10 * 1024 * 1024, backupCount=3),
+    ],
 )
 log = logging.getLogger(__name__)
 
@@ -52,6 +63,61 @@ TEAM_NAME_ALIASES: dict[str, list[str]] = {
     "Inter Milan": ["Inter", "FC Internazionale"],
     "AC Milan": ["Milan", "AC Milan"],
 }
+
+
+# ── Rate Limiter ──────────────────────────────────────────────────────────
+class _RateLimiter:
+    """Simple in-memory sliding window rate limiter."""
+
+    def __init__(self, name: str, max_requests: int, period_seconds: int):
+        self.name = name
+        self.max_requests = max_requests
+        self.period_seconds = period_seconds
+        self._timestamps: list[float] = []
+        self._lock = threading.Lock()
+
+    def check(self) -> bool:
+        now = time.time()
+        with self._lock:
+            self._timestamps = [
+                t for t in self._timestamps if now - t < self.period_seconds
+            ]
+            if len(self._timestamps) >= self.max_requests:
+                log.warning(
+                    f"Rate limit hit for {self.name}: "
+                    f"{len(self._timestamps)}/{self.max_requests} in {self.period_seconds}s"
+                )
+                return False
+            self._timestamps.append(now)
+            return True
+
+
+_api_football_limiter = _RateLimiter("API-Football", max_requests=95, period_seconds=86400)
+_odds_api_limiter = _RateLimiter("Odds-API", max_requests=480, period_seconds=30 * 86400)
+
+
+# ── Thread-safe market cache ─────────────────────────────────────────────
+_cache_lock = threading.Lock()
+_market_cache_ref: dict = {}
+
+
+def update_market_cache(markets: list) -> None:
+    """Thread-safe update of the market cache from the main loop."""
+    global _market_cache_ref
+    new_cache = {str(m.market_id): m for m in markets}
+    with _cache_lock:
+        _market_cache_ref.clear()
+        _market_cache_ref.update(new_cache)
+
+
+def get_cached_market(game_id: str):
+    """Thread-safe lookup of a market by game_id."""
+    with _cache_lock:
+        return _market_cache_ref.get(game_id)
+
+
+# ── Thread-safe history lock ─────────────────────────────────────────────
+_history_lock = threading.Lock()
 
 
 # ── Dataclasses ────────────────────────────────────────────────────────────
@@ -178,6 +244,8 @@ def fetch_soccer_markets() -> list[SoccerMarket]:
 
 # ── Pre-Match Stats: API-Football ──────────────────────────────────────────
 def _api_football_get(endpoint: str, params: dict) -> dict:
+    if not _api_football_limiter.check():
+        return {}
     headers = {"x-rapidapi-key": os.getenv("API_FOOTBALL_KEY", ""), "x-rapidapi-host": "v3.football.api-sports.io"}
     resp = requests.get(f"{API_FOOTBALL_BASE}/{endpoint}", headers=headers, params=params, timeout=10)
     if resp.ok:
@@ -291,6 +359,8 @@ def fetch_bookmaker_odds(home_team: str, away_team: str) -> dict:
     api_key = os.getenv("ODDS_API_KEY", "")
     if not api_key:
         return default
+    if not _odds_api_limiter.check():
+        return default
     try:
         resp = requests.get(
             f"{ODDS_API_BASE}/sports/soccer/odds",
@@ -393,13 +463,17 @@ async def listen_sports_ws(on_event_fn, market_cache: dict, stop_event: asyncio.
     Connects to wss://sports-api.polymarket.com/ws and calls on_event_fn
     with (event_data, matching_market) whenever a soccer score changes.
 
-    market_cache: dict mapping game_id → SoccerMarket (populated by main loop)
+    market_cache: dict reference (thread-safe via _cache_lock in callers)
     stop_event: asyncio.Event — set to stop this coroutine
     """
+    reconnect_delay = 5
+    max_reconnect_delay = 60
+
     while not stop_event.is_set():
         try:
             async with websockets.connect(SPORTS_WS_URL, ping_interval=None) as ws:
                 log.info("Sports WebSocket connected")
+                reconnect_delay = 5  # Reset on successful connect
                 while not stop_event.is_set():
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=15)
@@ -411,7 +485,7 @@ async def listen_sports_ws(on_event_fn, market_cache: dict, stop_event: asyncio.
                         # Score update events
                         if data.get("type") in ("score_update", "match_update", "goal"):
                             game_id = str(data.get("game_id", data.get("id", "")))
-                            matching = market_cache.get(game_id)
+                            matching = get_cached_market(game_id)
                             if matching:
                                 try:
                                     on_event_fn(data, matching)
@@ -421,8 +495,10 @@ async def listen_sports_ws(on_event_fn, market_cache: dict, stop_event: asyncio.
                         # Send keepalive
                         await ws.send(json.dumps({"type": "pong"}))
         except Exception as e:
-            log.warning(f"Sports WS disconnected: {e}. Reconnecting in 5s...")
-            await asyncio.sleep(5)
+            log.warning(f"Sports WS disconnected: {e}. Reconnecting in {reconnect_delay}s...")
+            await asyncio.sleep(reconnect_delay)
+            # Exponential backoff
+            reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
 
 
 # ── Order Execution ────────────────────────────────────────────────────────
@@ -431,6 +507,7 @@ def place_bet(token_id: str, amount_usd: float, side: str) -> dict:
     Place a Fill-or-Kill market order on Polymarket.
     side: "BUY" or "SELL"
     Returns the API response dict.
+    Raises RuntimeError if order is rejected.
     """
     client = get_clob_client()
     order_side = BUY if side == "BUY" else SELL
@@ -442,6 +519,13 @@ def place_bet(token_id: str, amount_usd: float, side: str) -> dict:
     signed = client.create_market_order(mo)
     resp = client.post_order(signed, OrderType.FOK)
     log.info(f"Order: token={token_id[:8]}.. amount=${amount_usd} side={side} resp={resp}")
+
+    # Validate response
+    if isinstance(resp, dict):
+        if resp.get("status") == "error" or (
+            "orderID" not in resp and "order_id" not in resp and "success" not in resp
+        ):
+            raise RuntimeError(f"Order rejected: {resp}")
     return resp
 
 
@@ -459,20 +543,26 @@ BET_HISTORY_PATH = "bet_history.jsonl"
 
 def load_bet_history() -> list[BetRecord]:
     records = []
-    try:
-        with open(BET_HISTORY_PATH) as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    records.append(BetRecord(**json.loads(line)))
-    except FileNotFoundError:
-        pass
+    with _history_lock:
+        try:
+            with open(BET_HISTORY_PATH) as f:
+                for i, line in enumerate(f):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        records.append(BetRecord(**json.loads(line)))
+                    except (json.JSONDecodeError, TypeError) as e:
+                        log.warning(f"Skipping corrupted bet_history line {i}: {e}")
+        except FileNotFoundError:
+            pass
     return records
 
 
 def append_bet(record: BetRecord):
-    with open(BET_HISTORY_PATH, "a") as f:
-        f.write(json.dumps(record.__dict__) + "\n")
+    with _history_lock:
+        with open(BET_HISTORY_PATH, "a") as f:
+            f.write(json.dumps(record.__dict__) + "\n")
 
 
 # ── Risk Controls ──────────────────────────────────────────────────────────
@@ -508,7 +598,6 @@ def calculate_metrics(records: Optional[list[BetRecord]] = None) -> dict:
     total_pnl = sum(pnls)
     win_rate  = sum(1 for p in pnls if p > 0) / len(pnls)
 
-    from collections import defaultdict
     daily: dict[str, float] = defaultdict(float)
     for r in resolved:
         daily[r.timestamp[:10]] += r.pnl_usd
