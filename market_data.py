@@ -254,12 +254,21 @@ def fetch_h2h(home_id: int, away_id: int, last_n: int = 10) -> dict:
 
 # ── Pre-Match Stats: Understat xG ─────────────────────────────────────────
 def fetch_xg_stats(team_name: str) -> dict:
-    """Returns avg xG for and against from last 5 matches via understatapi."""
+    """
+    Returns avg xG for and against from last 5 matches.
+    Uses understatapi if available; fails gracefully (xG is best-effort).
+    understatapi has a selenium version conflict — import is lazy and guarded.
+    """
     try:
+        # Patch selenium Options before understatapi import to avoid set_headless error
+        try:
+            from selenium.webdriver.chrome.options import Options as COptions
+            if not hasattr(COptions, "set_headless"):
+                COptions.set_headless = lambda self, headless=True: self.add_argument("--headless") if headless else None
+        except Exception:
+            pass
         from understatapi import UnderstatClient
         client = UnderstatClient()
-        # understatapi returns league/team search
-        # This is best-effort: name matching may fail for some teams
         results = client.team(team=team_name).get_match_data()
         if not results:
             return {"xg_for": 0.0, "xg_against": 0.0}
@@ -268,7 +277,7 @@ def fetch_xg_stats(team_name: str) -> dict:
         xg_against = float(np.mean([float(m.get("xGA", 0)) for m in recent]))
         return {"xg_for": round(xg_for, 3), "xg_against": round(xg_against, 3)}
     except Exception as e:
-        log.debug(f"xG fetch failed for {team_name}: {e}")
+        log.debug(f"xG fetch skipped for {team_name}: {e}")
         return {"xg_for": 0.0, "xg_against": 0.0}
 
 
