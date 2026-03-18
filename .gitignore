@@ -4,4 +4,6 @@ __pycache__/
 .venv/
 *.egg-info/
 .python-version
-bot.log\nresults.tsv\nbet_history.jsonl
+bot.log
+results.tsv
+bet_history.jsonl
