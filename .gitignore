@@ -5,5 +5,7 @@ __pycache__/
 *.egg-info/
 .python-version
 bot.log
+bot.log.*
 results.tsv
 bet_history.jsonl
+.bet_history_*.tmp

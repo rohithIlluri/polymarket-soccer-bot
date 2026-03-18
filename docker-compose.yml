@@ -1,0 +1,13 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./bet_history.jsonl:/app/bet_history.jsonl
+      - ./results.tsv:/app/results.tsv
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
